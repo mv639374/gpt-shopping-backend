@@ -20,6 +20,7 @@ from app.services.ai_analytics_service import (
 
 )
 from app.services.citation_service import CitationExtractor
+from app.utils.db import get_supabase_client
 from app.core.logger import logger
 
 router = APIRouter(prefix="/analytics", tags=["Analytics"])
@@ -304,3 +305,29 @@ async def get_citation_detail(marketplace_name: str, limit: int = 10):
 async def get_citation_source_detail(domain: str, limit: int=10):
     from app.services.ai_analytics_service import fetch_citation_source_detail
     return await fetch_citation_source_detail(domain, limit)
+
+
+@router.get("/regions")
+async def get_regions():
+    """Get all unique regions"""
+    try:
+        supabase = get_supabase_client()
+        response = supabase.table("responses-2").select("region").execute()
+        regions = list(set([r["region"] for r in response.data if r.get("region")]))
+        return sorted(regions)
+    except Exception as e:
+        logger.error(f"Error fetching regions: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/platforms")
+async def get_platforms():
+    """Get all unique platforms"""
+    try:
+        supabase = get_supabase_client()
+        response = supabase.table("responses-2").select("platform").execute()
+        platforms = list(set([r["platform"] for r in response.data if r.get("platform")]))
+        return sorted(platforms)
+    except Exception as e:
+        logger.error(f"Error fetching platforms: {e}")
+        raise HTTPException(status_code=500, detail=str(e))

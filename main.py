@@ -9,7 +9,7 @@ from app.core.config import settings
 from app.core.logger import logger, log_api_request
 from app.utils.db import db_manager
 from app.models.schemas import HealthCheckResponse, ErrorResponse
-from app.routers import analytics
+from app.routers import analytics, citations, citation_analytics
 
 
 @asynccontextmanager
@@ -100,6 +100,8 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 # Include routers
 app.include_router(analytics.router)
+app.include_router(citations.router)
+app.include_router(citation_analytics.router)
 
 
 # Root endpoint
@@ -138,16 +140,3 @@ async def health_check():
     except Exception as e:
         logger.error(f"❌ Health check endpoint failed: {e}")
         raise
-
-
-# Run the application
-if __name__ == "__main__":
-    import uvicorn
-    
-    uvicorn.run(
-        "main:app",
-        host=settings.host,
-        port=settings.port,
-        reload=settings.is_development,
-        log_level=settings.log_level.lower()
-    )

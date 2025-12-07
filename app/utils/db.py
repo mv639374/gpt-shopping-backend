@@ -3,6 +3,8 @@ from supabase import create_client, Client
 from app.core.config import settings
 from app.core.logger import logger, log_data_loading
 import pandas as pd
+import os
+from functools import lru_cache
 
 
 class DatabaseManager:
@@ -304,6 +306,25 @@ class DatabaseManager:
         
         logger.info(f"🏥 Health check complete: {results['status']}")
         return results
+
+
+@lru_cache()
+def get_supabase_client() -> Client:
+    """
+    Get Supabase client instance (cached)
+    """
+    supabase_url = os.getenv("SUPABASE_URL")
+    supabase_url = settings.supabase_url
+    supabase_key = os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_KEY")
+    supabase_key = settings.supabase_service_key
+    
+    if not supabase_url or not supabase_key:
+        raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_KEY must be set in environment variables")
+    
+    logger.info(f"🔗 Connecting to Supabase: {supabase_url[:30]}...")
+    
+    client = create_client(supabase_url, supabase_key)
+    return client
 
 
 # Global database manager instance

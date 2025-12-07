@@ -40,6 +40,8 @@ class Settings(BaseSettings):
     supabase_key: str = Field(..., alias="SUPABASE_KEY")
     supabase_service_key: str = Field(default="", alias="SUPABASE_SERVICE_KEY")
     database_url: str = Field(..., alias="DATABASE_URL")
+
+    gemini_api_key: str = Field(..., alias="GEMINI_API_KEY")
     
     # Redis Configuration
     upstash_redis_url: str = Field(default="", alias="UPSTASH_REDIS_URL")
