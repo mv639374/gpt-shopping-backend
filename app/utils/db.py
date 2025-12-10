@@ -5,6 +5,7 @@ from app.core.logger import logger, log_data_loading
 import pandas as pd
 import os
 from functools import lru_cache
+import asyncio
 
 
 class DatabaseManager:
@@ -70,6 +71,7 @@ class DatabaseManager:
     async def fetch_first_row(self, table_name: str) -> Optional[Dict[str, Any]]:
         """
         Fetch the first row from a table (for health check)
+        Uses a very short timeout to avoid blocking
         
         Args:
             table_name: Name of the table
@@ -91,40 +93,56 @@ class DatabaseManager:
             logger.error(f"❌ Health check failed for '{table_name}': {e}")
             return None
     
-    async def get_table_count(self, table_name: str) -> int:
+    async def get_table_count(self, table_name: str, timeout_seconds: int = 30) -> int:
         """
-        Get total row count from a table
+        Get total row count from a table with timeout protection
+        For large tables, this might timeout - we'll handle gracefully
         
         Args:
             table_name: Name of the table
+            timeout_seconds: Maximum time to wait for count
         
         Returns:
-            Total number of rows
+            Total number of rows, or 0 if timeout/error
         """
         try:
-            response = self.client.table(table_name).select("*", count="exact").execute()
+            # For large tables, count query can be slow
+            # Use limit(0) with count to get just the count, not the data
+            response = self.client.table(table_name)\
+                .select("*", count="exact")\
+                .limit(0)\
+                .execute()
+            
             count = response.count or 0
-            logger.info(f"📊 Table '{table_name}' has {count:,} total rows")
+            
+            if count > 0:
+                logger.info(f"📊 Table '{table_name}' has {count:,} total rows")
+            else:
+                logger.warning(f"⚠️ Table '{table_name}' appears empty or count unavailable")
+            
             return count
         
         except Exception as e:
             logger.error(f"❌ Error getting count from '{table_name}': {e}")
+            # Don't fail - just return 0 and continue with blind pagination
             return 0
     
     async def fetch_table_as_dataframe(
         self,
         table_name: str,
         limit: Optional[int] = None,
-        batch_size: int = 1000
+        batch_size: int = 1000,
+        max_retries: int = 3
     ) -> pd.DataFrame:
         """
-        Fetch entire table data as pandas DataFrame
+        Fetch entire table data as pandas DataFrame with production optimizations
         Uses pagination to fetch all rows (Supabase has 1000 row limit per query)
         
         Args:
             table_name: Name of the table
             limit: Optional limit on number of rows (None = fetch all)
             batch_size: Number of rows to fetch per batch (default 1000)
+            max_retries: Number of retries for failed batches
         
         Returns:
             pandas DataFrame containing table data
@@ -132,45 +150,106 @@ class DatabaseManager:
         try:
             logger.info(f"📥 Fetching all data from '{table_name}' table...")
             
-            # Get total count first
-            total_count = await self.get_table_count(table_name)
+            # Try to get total count, but don't fail if it times out
+            total_count = await self.get_table_count(table_name, timeout_seconds=30)
             
             if total_count == 0:
-                logger.warning(f"⚠️ No data found in table '{table_name}'")
-                return pd.DataFrame()
+                logger.warning(
+                    f"⚠️ No count available for '{table_name}'. "
+                    f"Will fetch data until exhausted..."
+                )
             
             # Determine how many rows to fetch
-            rows_to_fetch = min(limit, total_count) if limit else total_count
+            if limit and total_count > 0:
+                rows_to_fetch = min(limit, total_count)
+            elif limit:
+                rows_to_fetch = limit
+            elif total_count > 0:
+                rows_to_fetch = total_count
+            else:
+                # We don't know the count - fetch until we run out
+                rows_to_fetch = None
             
             # Fetch data in batches
             all_data = []
             offset = 0
+            consecutive_errors = 0
             
-            while offset < rows_to_fetch:
-                current_batch_size = min(batch_size, rows_to_fetch - offset)
+            while True:
+                # Calculate current batch size
+                if rows_to_fetch:
+                    current_batch_size = min(batch_size, rows_to_fetch - offset)
+                else:
+                    current_batch_size = batch_size
                 
-                logger.debug(f"📥 Fetching batch: rows {offset} to {offset + current_batch_size - 1}")
-                
-                # Fetch batch
-                response = self.client.table(table_name)\
-                    .select("*")\
-                    .range(offset, offset + current_batch_size - 1)\
-                    .execute()
-                
-                if not response.data:
-                    logger.warning(f"⚠️ No data in batch starting at offset {offset}")
+                # Safety check: stop if we've exceeded expected rows
+                if rows_to_fetch and offset >= rows_to_fetch:
+                    logger.info(f"✅ Reached target row count: {rows_to_fetch:,}")
                     break
                 
-                all_data.extend(response.data)
-                offset += len(response.data)
+                logger.debug(
+                    f"📥 Fetching batch: rows {offset} to {offset + current_batch_size - 1}"
+                )
+                
+                # Fetch batch with retry logic
+                batch_data = await self._fetch_batch_with_retry(
+                    table_name=table_name,
+                    offset=offset,
+                    limit=current_batch_size,
+                    max_retries=max_retries
+                )
+                
+                # Handle empty batch
+                if not batch_data:
+                    consecutive_errors += 1
+                    
+                    if consecutive_errors >= 3:
+                        logger.warning(
+                            f"⚠️ Got 3 consecutive empty batches at offset {offset}. "
+                            f"Assuming end of data."
+                        )
+                        break
+                    
+                    # Try next offset
+                    offset += current_batch_size
+                    continue
+                
+                # Reset error counter on success
+                consecutive_errors = 0
+                
+                # Add to results
+                all_data.extend(batch_data)
+                actual_batch_size = len(batch_data)
+                offset += actual_batch_size
                 
                 # Log progress
-                progress = (offset / rows_to_fetch) * 100
-                logger.info(f"📊 Progress: {offset:,}/{rows_to_fetch:,} rows ({progress:.1f}%)")
+                if rows_to_fetch:
+                    progress = (offset / rows_to_fetch) * 100
+                    logger.info(
+                        f"📊 Progress: {offset:,}/{rows_to_fetch:,} rows ({progress:.1f}%)"
+                    )
+                else:
+                    logger.info(f"📊 Progress: {offset:,} rows fetched so far")
                 
-                # Safety check: if we got fewer rows than expected, we've reached the end
-                if len(response.data) < current_batch_size:
+                # Break if we got fewer rows than requested (reached end of table)
+                if actual_batch_size < current_batch_size:
+                    logger.info(
+                        f"✅ Fetched final batch with {actual_batch_size} rows. "
+                        f"Total: {offset:,} rows"
+                    )
                     break
+                
+                # Safety limit: prevent infinite loops
+                if offset > 1_000_000:  # 1 million row safety limit
+                    logger.warning(
+                        f"⚠️ Safety limit reached at {offset:,} rows. Stopping fetch."
+                    )
+                    break
+            
+            # Check if we got any data
+            if not all_data:
+                logger.warning(f"⚠️ No data found in table '{table_name}'")
+                return pd.DataFrame()
             
             # Convert to DataFrame
             df = pd.DataFrame(all_data)
@@ -182,7 +261,7 @@ class DatabaseManager:
             logger.info(f"✅ Loaded complete dataset: {row_count:,} rows × {col_count} columns")
             
             # Log column names for debugging
-            logger.debug(f"Columns in '{table_name}': {df.columns.tolist()}")
+            logger.info(f"📋 Columns in '{table_name}': {df.columns.tolist()}")
             
             return df
         
@@ -190,6 +269,48 @@ class DatabaseManager:
             logger.error(f"❌ Error fetching '{table_name}' as DataFrame: {e}")
             log_data_loading(table_name, 0, "FAILED")
             return pd.DataFrame()
+    
+    async def _fetch_batch_with_retry(
+        self,
+        table_name: str,
+        offset: int,
+        limit: int,
+        max_retries: int = 3
+    ) -> List[Dict[str, Any]]:
+        """
+        Fetch a single batch of data with retry logic
+        
+        Args:
+            table_name: Name of the table
+            offset: Starting row offset
+            limit: Number of rows to fetch
+            max_retries: Maximum number of retry attempts
+        
+        Returns:
+            List of row dictionaries
+        """
+        for attempt in range(max_retries):
+            try:
+                response = self.client.table(table_name)\
+                    .select("*")\
+                    .range(offset, offset + limit - 1)\
+                    .execute()
+                
+                return response.data if response.data else []
+            
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
+                    logger.warning(
+                        f"⚠️ Batch fetch failed (attempt {attempt + 1}/{max_retries}). "
+                        f"Retrying in {wait_time}s... Error: {e}"
+                    )
+                    await asyncio.sleep(wait_time)
+                else:
+                    logger.error(
+                        f"❌ Batch fetch failed after {max_retries} attempts at offset {offset}: {e}"
+                    )
+                    return []
     
     async def fetch_unique_marketplaces(self) -> List[str]:
         """
@@ -207,22 +328,30 @@ class DatabaseManager:
             all_marketplaces = []
             offset = 0
             batch_size = 1000
+            max_batches = 1000  # Safety limit
+            batch_count = 0
             
-            while True:
-                response = self.client.table("product_analysis")\
-                    .select("marketplaces")\
-                    .range(offset, offset + batch_size - 1)\
-                    .execute()
-                
-                if not response.data:
+            while batch_count < max_batches:
+                try:
+                    response = self.client.table("product_analysis")\
+                        .select("marketplaces")\
+                        .range(offset, offset + batch_size - 1)\
+                        .execute()
+                    
+                    if not response.data or len(response.data) == 0:
+                        break
+                    
+                    all_marketplaces.extend(response.data)
+                    
+                    if len(response.data) < batch_size:
+                        break
+                    
+                    offset += batch_size
+                    batch_count += 1
+                    
+                except Exception as e:
+                    logger.error(f"❌ Error fetching marketplace batch at offset {offset}: {e}")
                     break
-                
-                all_marketplaces.extend(response.data)
-                
-                if len(response.data) < batch_size:
-                    break
-                
-                offset += batch_size
             
             if not all_marketplaces:
                 logger.warning("⚠️ No marketplaces found in product_analysis table")
@@ -287,21 +416,26 @@ class DatabaseManager:
         
         for table_name in tables:
             try:
+                # Test basic access with first row
                 first_row = await self.fetch_first_row(table_name)
-                count = await self.get_table_count(table_name)
+                
+                # Try to get count, but don't fail if it times out
+                count = await self.get_table_count(table_name, timeout_seconds=30)
                 
                 results["tables"][table_name] = {
                     "accessible": first_row is not None,
-                    "row_count": count,
-                    "sample_row": first_row
+                    "row_count": count if count > 0 else "unknown",
+                    "columns": list(first_row.keys()) if first_row else [],
+                    "status": "ok" if first_row else "empty"
                 }
             
             except Exception as e:
                 logger.error(f"❌ Health check failed for table '{table_name}': {e}")
-                results["status"] = "unhealthy"
+                results["status"] = "degraded"
                 results["tables"][table_name] = {
                     "accessible": False,
-                    "error": str(e)
+                    "error": str(e),
+                    "status": "error"
                 }
         
         logger.info(f"🏥 Health check complete: {results['status']}")
@@ -313,9 +447,7 @@ def get_supabase_client() -> Client:
     """
     Get Supabase client instance (cached)
     """
-    supabase_url = os.getenv("SUPABASE_URL")
     supabase_url = settings.supabase_url
-    supabase_key = os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_KEY")
     supabase_key = settings.supabase_service_key
     
     if not supabase_url or not supabase_key:

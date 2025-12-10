@@ -45,12 +45,28 @@ async def load_all_data() -> Dict[str, pd.DataFrame]:
     
     try:
         # Fetch product_analysis data
-        product_data = await db_manager.fetch_table_as_dataframe("product_analysis")
+        product_data = await db_manager.fetch_table_as_dataframe(
+            "product_analysis",
+            batch_size=1000  # Adjust based on your table size
+        )
         logger.info(f"✅ Loaded product_analysis: {len(product_data)} rows")
         
+        if len(product_data) > 0:
+            logger.info(f"📋 Product columns: {list(product_data.columns)}")
+        else:
+            logger.error("❌ product_analysis table is EMPTY!")
+        
         # Fetch normalized_score data
-        score_data = await db_manager.fetch_table_as_dataframe("normalized_score")
+        score_data = await db_manager.fetch_table_as_dataframe(
+            "normalized_score",
+            batch_size=1000
+        )
         logger.info(f"✅ Loaded normalized_score: {len(score_data)} rows")
+        
+        if len(score_data) > 0:
+            logger.info(f"📋 Score columns: {list(score_data.columns)}")
+        else:
+            logger.error("❌ normalized_score table is EMPTY!")
         
         dataframes = {
             'product_analysis': product_data,
@@ -74,45 +90,63 @@ async def get_unique_marketplaces() -> List[str]:
     if analytics_cache.has('unique_marketplaces'):
         return analytics_cache.get('unique_marketplaces')
     
-    # Load data
-    dataframes = await load_all_data()
-    df = dataframes['product_analysis']
-    
-    # Get unique marketplaces (case-insensitive deduplication)
-    marketplaces_dict = {}
-    
-    for marketplace in df['marketplaces'].dropna().unique():
-        marketplace_clean = str(marketplace).strip()
+    try:
+        # Load data
+        dataframes = await load_all_data()
+        df = dataframes['product_analysis']
         
-        # Skip empty
-        if not marketplace_clean:
-            continue
+        # Validate DataFrame
+        if df.empty:
+            logger.error("❌ product_analysis DataFrame is empty")
+            return []
         
-        marketplace_lower = marketplace_clean.lower()
+        # Validate 'marketplaces' column exists
+        if 'marketplaces' not in df.columns:
+            logger.error(
+                f"❌ 'marketplaces' column not found in product_analysis table. "
+                f"Available columns: {list(df.columns)}"
+            )
+            return []
         
-        if marketplace_lower not in marketplaces_dict:
-            marketplaces_dict[marketplace_lower] = marketplace_clean
-        else:
-            # Prefer capitalized version
-            existing = marketplaces_dict[marketplace_lower]
-            if marketplace_clean[0].isupper() and not existing[0].isupper():
+        # Get unique marketplaces (case-insensitive deduplication)
+        marketplaces_dict = {}
+        
+        for marketplace in df['marketplaces'].dropna().unique():
+            marketplace_clean = str(marketplace).strip()
+            
+            # Skip empty
+            if not marketplace_clean:
+                continue
+            
+            marketplace_lower = marketplace_clean.lower()
+            
+            if marketplace_lower not in marketplaces_dict:
                 marketplaces_dict[marketplace_lower] = marketplace_clean
-    
-    marketplaces = list(marketplaces_dict.values())
-    
-    # Sort: amazon first, then alphabetical
-    def sort_key(x):
-        if x.lower() == "amazon":
-            return (0, "")
-        return (1, x.lower())
-    
-    marketplaces.sort(key=sort_key)
-    
-    # Cache it
-    analytics_cache.set('unique_marketplaces', marketplaces)
-    
-    logger.info(f"✅ Found {len(marketplaces)} unique marketplaces")
-    return marketplaces
+            else:
+                # Prefer capitalized version
+                existing = marketplaces_dict[marketplace_lower]
+                if marketplace_clean[0].isupper() and not existing[0].isupper():
+                    marketplaces_dict[marketplace_lower] = marketplace_clean
+        
+        marketplaces = list(marketplaces_dict.values())
+        
+        # Sort: amazon first, then alphabetical
+        def sort_key(x):
+            if x.lower() == "amazon":
+                return (0, "")
+            return (1, x.lower())
+        
+        marketplaces.sort(key=sort_key)
+        
+        # Cache the result
+        analytics_cache.set('unique_marketplaces', marketplaces)
+        
+        logger.info(f"✅ Found {len(marketplaces)} unique marketplaces")
+        return marketplaces
+        
+    except Exception as e:
+        logger.error(f"❌ Error in get_unique_marketplaces: {e}")
+        return []
 
 
 async def calculate_marketplace_kpis(marketplace: str) -> Dict[str, Any]:
@@ -131,59 +165,81 @@ async def calculate_marketplace_kpis(marketplace: str) -> Dict[str, Any]:
     
     logger.info(f"📊 Calculating KPIs for {marketplace}...")
     
-    dataframes = await load_all_data()
-    score_df = dataframes['normalized_score']
-    
-    # Filter for this marketplace (case-insensitive)
-    marketplace_df = score_df[
-        score_df['marketplaces'].str.lower() == marketplace.lower()
-    ].copy()
-    
-    # Total unique categories
-    total_categories = score_df['product_category'].nunique()
-    
-    # 1. Visibility Score
-    categories_present = len(marketplace_df)
-    visibility_percentage = (categories_present / total_categories) * 100
-    
-    # 2. Market Leadership (Rank #1 positions)
-    rank_1_count = len(marketplace_df[marketplace_df['rank'] == 1])
-    leadership_percentage = (rank_1_count / total_categories) * 100
-    
-    # 3. Average Ranking (NOT percentage!)
-    avg_rank = marketplace_df['rank'].mean() if len(marketplace_df) > 0 else 0
-    
-    # 4. Opportunity Gap
-    opportunity_gap_percentage = ((total_categories - rank_1_count) / total_categories) * 100
-    non_rank1_categories = total_categories - rank_1_count
-    
-    kpis = {
-        "visibility_score": {
-            "percentage": round(visibility_percentage, 2),
-            "present_in": categories_present,
-            "total_categories": total_categories
-        },
-        "market_leadership": {
-            "percentage": round(leadership_percentage, 2),
-            "rank_1_count": rank_1_count,
-            "total_categories": total_categories
-        },
-        "avg_ranking": {
-            "value": round(avg_rank, 2),
-            "rating": "excellent" if avg_rank <= 2 else "good" if avg_rank <= 3 else "needs improvement"
-        },
-        "opportunity_gap": {
-            "percentage": round(opportunity_gap_percentage, 2),
-            "categories_not_rank1": non_rank1_categories,
-            "total_categories": total_categories
+    try:
+        dataframes = await load_all_data()
+        score_df = dataframes['normalized_score']
+        
+        # Validate data
+        if score_df.empty:
+            logger.error("❌ normalized_score DataFrame is empty")
+            return {
+                "error": "No data available",
+                "visibility_score": {"percentage": 0, "present_in": 0, "total_categories": 0},
+                "market_leadership": {"percentage": 0, "rank_1_count": 0, "total_categories": 0},
+                "avg_ranking": {"value": 0, "rating": "no data"},
+                "opportunity_gap": {"percentage": 0, "categories_not_rank1": 0, "total_categories": 0}
+            }
+        
+        # Filter for this marketplace (case-insensitive)
+        marketplace_df = score_df[
+            score_df['marketplaces'].str.lower() == marketplace.lower()
+        ].copy()
+        
+        # Total unique categories
+        total_categories = score_df['product_category'].nunique()
+        
+        # 1. Visibility Score
+        categories_present = len(marketplace_df)
+        visibility_percentage = (categories_present / total_categories) * 100 if total_categories > 0 else 0
+        
+        # 2. Market Leadership (Rank #1 positions)
+        rank_1_count = len(marketplace_df[marketplace_df['rank'] == 1])
+        leadership_percentage = (rank_1_count / total_categories) * 100 if total_categories > 0 else 0
+        
+        # 3. Average Ranking
+        avg_rank = marketplace_df['rank'].mean() if len(marketplace_df) > 0 else 0
+        
+        # 4. Opportunity Gap
+        opportunity_gap_percentage = ((total_categories - rank_1_count) / total_categories) * 100 if total_categories > 0 else 0
+        non_rank1_categories = total_categories - rank_1_count
+        
+        kpis = {
+            "visibility_score": {
+                "percentage": round(visibility_percentage, 2),
+                "present_in": categories_present,
+                "total_categories": total_categories
+            },
+            "market_leadership": {
+                "percentage": round(leadership_percentage, 2),
+                "rank_1_count": rank_1_count,
+                "total_categories": total_categories
+            },
+            "avg_ranking": {
+                "value": round(avg_rank, 2),
+                "rating": "excellent" if avg_rank <= 2 else "good" if avg_rank <= 3 else "needs improvement"
+            },
+            "opportunity_gap": {
+                "percentage": round(opportunity_gap_percentage, 2),
+                "categories_not_rank1": non_rank1_categories,
+                "total_categories": total_categories
+            }
         }
-    }
-    
-    # Cache the result
-    analytics_cache.set(cache_key, kpis)
-    
-    logger.info(f"✅ KPIs calculated for {marketplace}")
-    return kpis
+        
+        # Cache the result
+        analytics_cache.set(cache_key, kpis)
+        
+        logger.info(f"✅ KPIs calculated for {marketplace}")
+        return kpis
+        
+    except Exception as e:
+        logger.error(f"❌ Error calculating KPIs for {marketplace}: {e}")
+        return {
+            "error": str(e),
+            "visibility_score": {"percentage": 0, "present_in": 0, "total_categories": 0},
+            "market_leadership": {"percentage": 0, "rank_1_count": 0, "total_categories": 0},
+            "avg_ranking": {"value": 0, "rating": "error"},
+            "opportunity_gap": {"percentage": 0, "categories_not_rank1": 0, "total_categories": 0}
+        }
 
 
 async def get_marketplace_heatmap(marketplace: str, limit: int = 5) -> Dict[str, Any]:
@@ -648,13 +704,6 @@ async def get_product_analytics(category: str, product_name: str) -> Dict[str, A
 async def get_no_rank_analysis(marketplace: str, limit: int = 7) -> Dict[str, Any]:
     """
     Get top categories where marketplace has no rank (missing products)
-    
-    Args:
-        marketplace: Selected marketplace name
-        limit: Number of top categories to return
-    
-    Returns:
-        Dict with no-rank analysis data
     """
     
     cache_key = f'no_rank_analysis_{marketplace.lower()}_{limit}'
@@ -664,56 +713,91 @@ async def get_no_rank_analysis(marketplace: str, limit: int = 7) -> Dict[str, An
     
     logger.info(f"📊 Generating no-rank analysis for {marketplace}...")
     
-    dataframes = await load_all_data()
-    product_df = dataframes['product_analysis']
-    
-    # Get all unique categories
-    all_categories = product_df['product_category'].unique()
-    
-    no_rank_data = []
-    
-    for category in all_categories:
-        # Get all products in this category
-        category_products = product_df[product_df['product_category'] == category]
-        total_products = len(category_products['product_name'].dropna().unique())
+    try:
+        dataframes = await load_all_data()
+        product_df = dataframes['product_analysis']
         
-        # Get products where marketplace appears
-        marketplace_products = category_products[
-            category_products['marketplaces'].str.lower() == marketplace.lower()
-        ]
-        products_with_rank = len(marketplace_products['product_name'].dropna().unique())
+        # Validate DataFrame
+        if product_df.empty:
+            logger.error("❌ product_analysis DataFrame is empty")
+            return {
+                "marketplace": marketplace,
+                "top_no_rank_categories": [],
+                "total_categories_analyzed": 0,
+                "error": "No data available in product_analysis table"
+            }
         
-        # Calculate missing products
-        missing_products = total_products - products_with_rank
-        missing_percentage = (missing_products / total_products * 100) if total_products > 0 else 0
+        # Validate required columns
+        required_columns = ['product_category', 'marketplaces', 'product_name']
+        missing_columns = [col for col in required_columns if col not in product_df.columns]
         
-        if missing_products > 0:
-            no_rank_data.append({
-                "category": str(category),
-                "total_products": int(total_products),
-                "products_with_rank": int(products_with_rank),
-                "missing_products": int(missing_products),
-                "missing_percentage": round(missing_percentage, 2)
-            })
-    
-    # Sort by missing products count (descending)
-    no_rank_data.sort(key=lambda x: x['missing_products'], reverse=True)
-    
-    # Get top N
-    top_categories = no_rank_data[:limit]
-    
-    result = {
-        "marketplace": marketplace,
-        "top_no_rank_categories": top_categories,
-        "total_categories_analyzed": len(all_categories)
-    }
-    
-    # Cache it
-    analytics_cache.set(cache_key, result)
-    
-    logger.info(f"✅ No-rank analysis generated for {marketplace}")
-    return result
-
+        if missing_columns:
+            logger.error(
+                f"❌ Missing required columns in product_analysis: {missing_columns}. "
+                f"Available: {list(product_df.columns)}"
+            )
+            return {
+                "marketplace": marketplace,
+                "top_no_rank_categories": [],
+                "total_categories_analyzed": 0,
+                "error": f"Missing columns: {missing_columns}"
+            }
+        
+        # Get all unique categories
+        all_categories = product_df['product_category'].unique()
+        
+        no_rank_data = []
+        
+        for category in all_categories:
+            # Get all products in this category
+            category_products = product_df[product_df['product_category'] == category]
+            total_products = len(category_products['product_name'].dropna().unique())
+            
+            # Get products where marketplace appears
+            marketplace_products = category_products[
+                category_products['marketplaces'].str.lower() == marketplace.lower()
+            ]
+            products_with_rank = len(marketplace_products['product_name'].dropna().unique())
+            
+            # Calculate missing products
+            missing_products = total_products - products_with_rank
+            missing_percentage = (missing_products / total_products * 100) if total_products > 0 else 0
+            
+            if missing_products > 0:
+                no_rank_data.append({
+                    "category": str(category),
+                    "total_products": int(total_products),
+                    "products_with_rank": int(products_with_rank),
+                    "missing_products": int(missing_products),
+                    "missing_percentage": round(missing_percentage, 2)
+                })
+        
+        # Sort by missing products count (descending)
+        no_rank_data.sort(key=lambda x: x['missing_products'], reverse=True)
+        
+        # Get top N
+        top_categories = no_rank_data[:limit]
+        
+        result = {
+            "marketplace": marketplace,
+            "top_no_rank_categories": top_categories,
+            "total_categories_analyzed": len(all_categories)
+        }
+        
+        # Cache it
+        analytics_cache.set(cache_key, result)
+        
+        logger.info(f"✅ No-rank analysis generated for {marketplace}")
+        return result
+        
+    except Exception as e:
+        logger.error(f"❌ Error in get_no_rank_analysis: {e}")
+        return {
+            "marketplace": marketplace,
+            "top_no_rank_categories": [],
+            "total_categories_analyzed": 0,
+            "error": str(e)
+        }
 
 async def get_low_rank_analysis(marketplace: str, limit: int = 7, low_rank_threshold: int = 5) -> Dict[str, Any]:
     """
